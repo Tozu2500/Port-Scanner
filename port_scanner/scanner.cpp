@@ -85,3 +85,9 @@ static bool tcpConnect(const sockaddr_in& baseAddr, int port, int timeoutMs, dou
     return open;
 }
 
+// Grab the banner by sending generic probes + reading 256 bytes
+// Works well for HTTP SSH FTP SMTP ETC:::
+
+static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeoutMs) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+}
