@@ -73,6 +73,15 @@ static bool tcpConnect(const sockaddr_in& baseAddr, int port, int timeoutMs, dou
     if (r > 0 && FD_ISSET(s, &wset)) {
         // Here verify the connection truly completed, no pending errors.
         int err = 0;
-        
+        int len = sizeof(err);
+        getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+        open = (err == 0);
     }
+
+    auto t1 = std::chrono::steady_clock::now();
+    responseMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    closesocket(s);
+    return open;
 }
+
