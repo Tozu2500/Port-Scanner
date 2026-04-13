@@ -34,3 +34,45 @@ static bool resolveHost(const std::string& host, sockaddr_in& addr) {
     freeaddrinfo(res);
     return true;
 }
+
+// Connect with milliseconds timeout using nonblocking socket + select
+// This returns TRUE if the port is open; fills responseMs
+static bool tcpConnect(const sockaddr_in& baseAddr, int port, int timeoutMs, double& responseMs) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    if (s == INVALID_SOCKET) {
+        return false;
+    }
+
+    // Non Blocking mode
+    u_long mode = 1;
+    ioctlsocket(s, FIONBIO, &mode);
+
+    sockaddr_in addr = baseAddr;
+    addr.sin_port = htons(static_cast<u_short>(port));
+
+    auto t0 = std::chrono::steady_clock::now();
+    connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+
+    fd_set wset, eset;
+    FD_ZERO(&wset);
+    FD_SET(s, &wset);
+
+    FD_ZERO(&eset);
+    FD_SET(s, &eset);
+
+    TIMEVAL tv;
+
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+
+    int r = select(0, nullptr, &wset, &eset, &tv);
+
+    bool open = false;
+
+    if (r > 0 && FD_ISSET(s, &wset)) {
+        // Here verify the connection truly completed, no pending errors.
+        int err = 0;
+        
+    }
+}
