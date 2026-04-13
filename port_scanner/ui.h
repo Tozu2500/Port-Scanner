@@ -52,3 +52,42 @@ namespace ansi {
         printf("\033[%dG");
     }
 }
+
+// Console setup
+inline void enableAnsi() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    GetConsoleMode(h, &mode);
+    SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+    SetConsoleOutputCP(CP_UTF8);
+}
+
+inline int consoleWidth() {
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &ci))
+        return ci.srWindow.Right - ci.srWindow.Left + 1;
+    return 80;
+}
+
+// Progress bar
+inline std::string progressBar(int done, int total, int width = 30) {
+    int filled = (total > 0) ? (done * width / total) : 0;
+
+    std::string bar;
+    bar += ansi::BLUE;
+
+    for (int i = 0; i < filled; ++i) {
+        bar += (char)0xDB;
+    }
+
+    bar += ansi::DIM;
+    bar += ansi::BLACK;
+
+    for (int i = filled; i < width; ++i) {
+        bar += '-';
+    }
+
+    bar += ansi::RESET;
+    return bar;
+}
