@@ -90,4 +90,15 @@ static bool tcpConnect(const sockaddr_in& baseAddr, int port, int timeoutMs, dou
 
 static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeoutMs) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    if (s == INVALID_SOCKET) {
+        return "";
+    }
+
+    // Blocking connect with small timeout
+    DWORD tv = static_cast<DWORD>(timeoutMs&);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
+
+    
 }
