@@ -127,7 +127,7 @@ static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeout
     banner.reserve(static_cast<size_t>(received));
 
     for (int i = 0; i < received; ++i) {
-        unsigned char c = static_cast<unsigned_char>(buf[i]);
+        unsigned char c = static_cast<unsigned char>(buf[i]);
 
         if (c >= 0x20 && c < 0x7F)
             banner += static_cast<char>(c);
@@ -157,3 +157,40 @@ static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeout
 
     return out;
 }
+
+// Thread pool
+
+class ThreadPool {
+public:
+    explicit ThreadPool(int n) {
+        for (int i = 0; i < n; ++i)
+            workers_.emplace_back([this]{ workerLoop(); });
+    }
+    ~ThreadPool() {
+        { std::unique_lock<std::mutex> lk(mu_); done_ = true; }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+    void enqueue(std::function<void()> task) {
+        { std::unique_lock<std::mutex> lk(mu_); q_.push(std::move(task)); }
+        cv_.notify_one();
+    }
+private:
+    void workerLoop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [this]{ return done_ || !q_.empty(); });
+                if (done_ && q_.empty()) return;
+                task = std::move(q_.front()); q_.pop();
+            }
+            task();
+        }
+    }
+    std::vector<std::thread>        workers_;
+    std::queue<std::function<void()>> q_;
+    std::mutex                       mu_;
+    std::condition_variable          cv_;
+    bool                             done_ = false;
+};
