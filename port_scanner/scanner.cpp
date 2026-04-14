@@ -114,5 +114,46 @@ static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeout
         send(s, probe, static_cast<int>(strlen(probe)), 0);
     }
 
-    
+    char buf[257]{};
+
+    int received = recv(s, buf, 256, 0);
+    closesocket(s);
+
+
+    if (received <= 0) return "";
+
+    // Strip control chars except space & tab
+    std::string banner;
+    banner.reserve(static_cast<size_t>(received));
+
+    for (int i = 0; i < received; ++i) {
+        unsigned char c = static_cast<unsigned_char>(buf[i]);
+
+        if (c >= 0x20 && c < 0x7F)
+            banner += static_cast<char>(c);
+        else if (c == '\n' || c == '\r')
+            banner += ' ';
+    }
+
+    // Collapse whitespaces / trim
+    std::string out;
+    bool space = false;
+
+    for (char ch : banner) {
+        if (ch == ' ') {
+            if (!space) {
+                out += ' ';
+                space = true;
+            }
+        } else {
+            out += ch;
+            space = false;
+        }
+    }
+
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+
+    if (out.size() > 80) out = out.substr(0, 77) + "...";
+
+    return out;
 }
