@@ -24,7 +24,7 @@ struct ScanConfig {
     int bannerTimeoutMs = 2000;
 };
 
-using ProgressCallBack = std::function<void(int scanned, int total, const ScanResult&)>;
+using ProgressCallback = std::function<void(int scanned, int total, const ScanResult&)>;
 
 std::vector<ScanResult> runScan(
     const ScanConfig& cfg,

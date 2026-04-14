@@ -2,195 +2,350 @@
 #include "services.h"
 
 #define WIN32_LEAN_AND_MEAN
-
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 
-#include <vector>
-#include <thread>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <queue>
-#include <condition_variable>
-#include <chrono>
-#include <algorithm>
-#include <string>
-#include <atomic>
 #include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
-// Helper functions
-static bool resolveHost(const std::string& host, sockaddr_in& addr) {
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
 
-    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res)
+//  DNS resolution
+
+// Turns a hostname or IP string into a sockaddr_in we can connect to.
+// Returns false if the host cannot be resolved.
+static bool resolveHost(const std::string& host, sockaddr_in& outAddr)
+{
+    addrinfo hints{};
+    hints.ai_family   = AF_INET;       // IPv4 only
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* results = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &results) != 0 || !results)
         return false;
 
-    addr = *reinterpret_cast<sockaddr_in*>(res->ai_addr);
-    freeaddrinfo(res);
+    outAddr = *reinterpret_cast<sockaddr_in*>(results->ai_addr);
+    freeaddrinfo(results);
     return true;
 }
 
-// Connect with milliseconds timeout using nonblocking socket + select
-// This returns TRUE if the port is open; fills responseMs
-static bool tcpConnect(const sockaddr_in& baseAddr, int port, int timeoutMs, double& responseMs) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+//  TCP connect probe
 
-    if (s == INVALID_SOCKET) {
+// Attempts a TCP connection to the given port within timeoutMs milliseconds.
+// Uses a non-blocking socket + select() so we never block a thread for longer
+// than the timeout, even if the remote host simply drops the packet.
+// Returns true if the port is open; always fills outResponseMs.
+static bool tcpConnect(const sockaddr_in& baseAddr,
+                       int                port,
+                       int                timeoutMs,
+                       double&            outResponseMs)
+{
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET)
         return false;
+
+    // Switch to non-blocking so connect() returns immediately
+    u_long nonBlocking = 1;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
+
+    // Fill in the target port
+    sockaddr_in target = baseAddr;
+    target.sin_port    = htons(static_cast<u_short>(port));
+
+    auto startTime = std::chrono::steady_clock::now();
+
+    // connect() will return WSAEWOULDBLOCK — that is expected
+    connect(sock, reinterpret_cast<sockaddr*>(&target), sizeof(target));
+
+    // Wait for the socket to become writable, which means the connection
+    // either succeeded or was refused
+    fd_set writeSet;
+    FD_ZERO(&writeSet);
+    FD_SET(sock, &writeSet);
+
+    TIMEVAL timeout;
+    timeout.tv_sec  = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+
+    bool portIsOpen = false;
+
+    if (select(0, nullptr, &writeSet, nullptr, &timeout) > 0
+        && FD_ISSET(sock, &writeSet))
+    {
+        // The socket became writable, but we must check SO_ERROR to distinguish
+        // a successful connection from a refused one
+        int  socketError = 0;
+        int  optLen      = sizeof(socketError);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                   reinterpret_cast<char*>(&socketError), &optLen);
+
+        portIsOpen = (socketError == 0);
     }
 
-    // Non Blocking mode
-    u_long mode = 1;
-    ioctlsocket(s, FIONBIO, &mode);
+    auto endTime   = std::chrono::steady_clock::now();
+    outResponseMs  = std::chrono::duration<double, std::milli>(endTime - startTime).count();
 
-    sockaddr_in addr = baseAddr;
-    addr.sin_port = htons(static_cast<u_short>(port));
-
-    auto t0 = std::chrono::steady_clock::now();
-    connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-
-    fd_set wset, eset;
-    FD_ZERO(&wset);
-    FD_SET(s, &wset);
-
-    FD_ZERO(&eset);
-    FD_SET(s, &eset);
-
-    TIMEVAL tv;
-
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-
-    int r = select(0, nullptr, &wset, &eset, &tv);
-
-    bool open = false;
-
-    if (r > 0 && FD_ISSET(s, &wset)) {
-        // Here verify the connection truly completed, no pending errors.
-        int err = 0;
-        int len = sizeof(err);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
-        open = (err == 0);
-    }
-
-    auto t1 = std::chrono::steady_clock::now();
-    responseMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-    closesocket(s);
-    return open;
+    closesocket(sock);
+    return portIsOpen;
 }
 
-// Grab the banner by sending generic probes + reading 256 bytes
-// Works well for HTTP SSH FTP SMTP ETC:::
+//  Banner grabbing
 
-static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeoutMs) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+// Returns true if this port number is an HTTP variant that needs a request
+// before it will send anything back
+static bool isHttpPort(int port)
+{
+    return port == 80 || port == 443 || port == 8080 || port == 8443;
+}
 
-    if (s == INVALID_SOCKET) {
-        return "";
+// Cleans up raw socket bytes into a printable single-line string.
+// Replaces control characters with spaces, collapses runs of whitespace,
+// and trims both ends.
+static std::string cleanBannerText(const char* buf, int length)
+{
+    // Replace non-printable bytes with spaces
+    std::string text;
+    text.reserve(static_cast<size_t>(length));
+
+    for (int i = 0; i < length; ++i)
+    {
+        unsigned char byte = static_cast<unsigned char>(buf[i]);
+        bool isPrintable   = (byte >= 0x20 && byte < 0x7F);
+        bool isNewline     = (byte == '\n' || byte == '\r');
+
+        if      (isPrintable) text += static_cast<char>(byte);
+        else if (isNewline)   text += ' ';
     }
 
-    // Blocking connect with small timeout
-    DWORD tv = static_cast<DWORD>(timeoutMs);
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
+    // Collapse multiple spaces into one
+    std::string collapsed;
+    bool inSpace = false;
 
-    sockaddr_in addr = baseAddr;
-    addr.sin_port = htons(static_cast<u_short>(port));
-
-    if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        closesocket(s);
-        return "";
-    }
-
-    // HTTP gets HEAD request
-    if (port == 80 || port == 8080 || port == 8443 || port == 443) {
-        const char* probe = "HEAD / HTTP/1.0\r\n\r\n";
-        send(s, probe, static_cast<int>(strlen(probe)), 0);
-    }
-
-    char buf[257]{};
-
-    int received = recv(s, buf, 256, 0);
-    closesocket(s);
-
-
-    if (received <= 0) return "";
-
-    // Strip control chars except space & tab
-    std::string banner;
-    banner.reserve(static_cast<size_t>(received));
-
-    for (int i = 0; i < received; ++i) {
-        unsigned char c = static_cast<unsigned char>(buf[i]);
-
-        if (c >= 0x20 && c < 0x7F)
-            banner += static_cast<char>(c);
-        else if (c == '\n' || c == '\r')
-            banner += ' ';
-    }
-
-    // Collapse whitespaces / trim
-    std::string out;
-    bool space = false;
-
-    for (char ch : banner) {
-        if (ch == ' ') {
-            if (!space) {
-                out += ' ';
-                space = true;
-            }
-        } else {
-            out += ch;
-            space = false;
+    for (char ch : text)
+    {
+        if (ch == ' ')
+        {
+            if (!inSpace) { collapsed += ' '; inSpace = true; }
+        }
+        else
+        {
+            collapsed += ch;
+            inSpace = false;
         }
     }
 
-    while (!out.empty() && out.back() == ' ') out.pop_back();
+    // Trim trailing space
+    while (!collapsed.empty() && collapsed.back() == ' ')
+        collapsed.pop_back();
 
-    if (out.size() > 80) out = out.substr(0, 77) + "...";
+    // Truncate to a display-friendly length
+    const size_t maxLength = 80;
+    if (collapsed.size() > maxLength)
+        collapsed = collapsed.substr(0, maxLength - 3) + "...";
 
-    return out;
+    return collapsed;
 }
 
-// Thread pool
+// Opens a fresh blocking connection to the port and reads the server's
+// opening message (e.g. "SSH-2.0-OpenSSH_8.9", "220 mail.example.com").
+// HTTP ports get a HEAD request first because they don't speak until asked.
+// Returns an empty string if nothing is received within timeoutMs.
+static std::string grabBanner(const sockaddr_in& baseAddr,
+                               int                port,
+                               int                timeoutMs)
+{
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET)
+        return "";
 
-class ThreadPool {
+    // Set a hard deadline on both send and receive
+    DWORD timeoutDword = static_cast<DWORD>(timeoutMs);
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<char*>(&timeoutDword), sizeof(timeoutDword));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<char*>(&timeoutDword), sizeof(timeoutDword));
+
+    sockaddr_in target = baseAddr;
+    target.sin_port    = htons(static_cast<u_short>(port));
+
+    if (connect(sock, reinterpret_cast<sockaddr*>(&target), sizeof(target)) != 0)
+    {
+        closesocket(sock);
+        return "";
+    }
+
+    // HTTP servers wait for a request; everything else (SSH, FTP, SMTP ...)
+    // sends a greeting as soon as the connection opens
+    if (isHttpPort(port))
+    {
+        const char* httpProbe = "HEAD / HTTP/1.0\r\n\r\n";
+        send(sock, httpProbe, static_cast<int>(strlen(httpProbe)), 0);
+    }
+
+    char rawBuffer[257]{};
+    int  bytesReceived = recv(sock, rawBuffer, 256, 0);
+    closesocket(sock);
+
+    if (bytesReceived <= 0)
+        return "";
+
+    return cleanBannerText(rawBuffer, bytesReceived);
+}
+
+
+//  Thread pool
+
+// A simple fixed-size thread pool.  Workers pull tasks from a shared queue
+// and run them.  The pool is destroyed (and all threads joined) when it goes
+// out of scope.
+class ThreadPool
+{
 public:
-    explicit ThreadPool(int n) {
-        for (int i = 0; i < n; ++i)
-            workers_.emplace_back([this]{ workerLoop(); });
+    explicit ThreadPool(int threadCount)
+    {
+        for (int i = 0; i < threadCount; ++i)
+            workers_.emplace_back([this] { workerLoop(); });
     }
-    ~ThreadPool() {
-        { std::unique_lock<std::mutex> lk(mu_); done_ = true; }
-        cv_.notify_all();
-        for (auto& t : workers_) t.join();
+
+    ~ThreadPool()
+    {
+        // Signal all workers to finish and wait for them
+        {
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            shuttingDown_ = true;
+        }
+        workReady_.notify_all();
+
+        for (std::thread& worker : workers_)
+            worker.join();
     }
-    void enqueue(std::function<void()> task) {
-        { std::unique_lock<std::mutex> lk(mu_); q_.push(std::move(task)); }
-        cv_.notify_one();
+
+    void enqueue(std::function<void()> task)
+    {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            taskQueue_.push(std::move(task));
+        }
+        workReady_.notify_one();
     }
+
 private:
-    void workerLoop() {
-        while (true) {
+    void workerLoop()
+    {
+        while (true)
+        {
             std::function<void()> task;
+
             {
-                std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait(lk, [this]{ return done_ || !q_.empty(); });
-                if (done_ && q_.empty()) return;
-                task = std::move(q_.front()); q_.pop();
+                std::unique_lock<std::mutex> lock(queueMutex_);
+                workReady_.wait(lock, [this]
+                {
+                    return shuttingDown_ || !taskQueue_.empty();
+                });
+
+                if (shuttingDown_ && taskQueue_.empty())
+                    return;
+
+                task = std::move(taskQueue_.front());
+                taskQueue_.pop();
             }
+
             task();
         }
     }
-    std::vector<std::thread>        workers_;
-    std::queue<std::function<void()>> q_;
-    std::mutex                       mu_;
-    std::condition_variable          cv_;
-    bool                             done_ = false;
+
+    std::vector<std::thread>          workers_;
+    std::queue<std::function<void()>> taskQueue_;
+    std::mutex                        queueMutex_;
+    std::condition_variable           workReady_;
+    bool                              shuttingDown_ = false;
 };
+
+
+//  Public entry point
+
+std::vector<ScanResult> runScan(const ScanConfig&  cfg,
+                                std::atomic<bool>& cancelFlag,
+                                ProgressCallback   onResult)
+{
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    // Resolve the hostname once, then reuse the address for every port
+    sockaddr_in baseAddr{};
+    if (!resolveHost(cfg.host, baseAddr))
+    {
+        WSACleanup();
+        return {};
+    }
+
+    const int        totalPorts   = cfg.endPort - cfg.startPort + 1;
+    std::atomic<int> portsScanned { 0 };
+
+    std::vector<ScanResult> openResults;
+    std::mutex              openResultsMutex;
+
+    // Scope the pool so its destructor blocks until all tasks finish
+    {
+        int poolSize = std::min(cfg.threads, totalPorts);
+        ThreadPool pool(poolSize);
+
+        for (int port = cfg.startPort; port <= cfg.endPort; ++port)
+        {
+            if (cancelFlag) break;
+
+            pool.enqueue([&, port]
+            {
+                if (cancelFlag) return;
+
+                // 1. Test whether the port is open
+                double responseMs = 0.0;
+                bool   isOpen     = tcpConnect(baseAddr, port, cfg.timeoutMs, responseMs);
+
+                // 2. Build the result record
+                ScanResult result;
+                result.port       = port;
+                result.open       = isOpen;
+                result.service    = lookupService(port);
+                result.responseMs = responseMs;
+
+                // 3. Optionally grab the service banner
+                if (isOpen && cfg.grabBanners)
+                    result.banner = grabBanner(baseAddr, port, cfg.bannerTimeoutMs);
+
+                // 4. Report progress to the caller
+                int scannedSoFar = ++portsScanned;
+                onResult(scannedSoFar, totalPorts, result);
+
+                // 5. Store open ports for the final report
+                if (isOpen)
+                {
+                    std::lock_guard<std::mutex> lock(openResultsMutex);
+                    openResults.push_back(result);
+                }
+            });
+        }
+    } // ThreadPool destructor joins all workers here
+
+    WSACleanup();
+
+    // Sort by port number so the results table is in a logical order
+    std::sort(openResults.begin(), openResults.end(),
+              [](const ScanResult& a, const ScanResult& b)
+              {
+                  return a.port < b.port;
+              });
+
+    return openResults;
+}
