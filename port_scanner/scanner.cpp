@@ -96,9 +96,12 @@ static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeout
     }
 
     // Blocking connect with small timeout
-    DWORD tv = static_cast<DWORD>(timeoutMs&);
+    DWORD tv = static_cast<DWORD>(timeoutMs);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
 
-    
+    sockaddr_in addr = baseAddr;
+    addr.sin_port = htons(static_cast<u_short>(port));
+
+    if (connect())
 }
