@@ -103,5 +103,16 @@ static std::string grabBanner(const sockaddr_in& baseAddr, int port, int timeout
     sockaddr_in addr = baseAddr;
     addr.sin_port = htons(static_cast<u_short>(port));
 
-    if (connect())
+    if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closesocket(s);
+        return "";
+    }
+
+    // HTTP gets HEAD request
+    if (port == 80 || port == 8080 || port == 8443 || port == 443) {
+        const char* probe = "HEAD / HTTP/1.0\r\n\r\n";
+        send(s, probe, static_cast<int>(strlen(probe)), 0);
+    }
+
+    
 }
